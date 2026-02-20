@@ -13,6 +13,16 @@ from PIL import Image
 
 from backend import common
 
+# Thresholds for target labels (from materials.py cf_thrsd_dict)
+TEXT_READING_THRESHOLDS = {
+    "sign": 55,
+    "oldWatermeter": 50,
+    "newWatermeter": 50,
+    "radiometer": 50,
+    # LCD_SCREEN variants use 60 (from _cropped_image_from_rekognition default)
+    "LCD_SCREEN": 60.0,
+}
+
 
 def _get_bedrock_client(region: str, profile_name: str | None = None):
     """
@@ -185,25 +195,34 @@ def _resolve_image_path(input_folder: str, image_name_without_suffix: str) -> st
 
 def _has_target_label(cached: dict) -> bool:
     """
-    Check if the image has any of the target labels that require text reading:
-    - "sign"
-    - "oldWatermeter" or "newWatermeter"
-    - "radiometer"
-    - "LCD_SCREEN" (or variants like "LCD_SCREEN_0", "LCD_SCREEN_0_MAIN")
+    Check if the image has any of the target labels that require text reading
+    AND the label confidence is above the threshold:
+    - "sign" >= 55
+    - "oldWatermeter" or "newWatermeter" >= 50
+    - "radiometer" >= 50
+    - "LCD_SCREEN" variants >= 60
     """
-    target_labels = {"sign", "oldWatermeter", "newWatermeter", "radiometer"}
-    target_prefixes = {"LCD_SCREEN"}
-    
     # Check scale_labels
     for label in cached.get("scale_labels", []):
         label_name = label.get("Name", "")
-        if label_name in target_labels or any(label_name.startswith(prefix) for prefix in target_prefixes):
+        confidence = label.get("Confidence", 0)
+        
+        # Check LCD_SCREEN variants
+        if label_name.startswith("LCD_SCREEN") and confidence >= 60.0:
+            return True
+        
+        # Check other target labels
+        threshold = TEXT_READING_THRESHOLDS.get(label_name)
+        if threshold is not None and confidence >= threshold:
             return True
     
     # Check material_labels
     for label in cached.get("material_labels", []):
         label_name = label.get("Name", "")
-        if label_name in target_labels or any(label_name.startswith(prefix) for prefix in target_prefixes):
+        confidence = label.get("Confidence", 0)
+        
+        threshold = TEXT_READING_THRESHOLDS.get(label_name)
+        if threshold is not None and confidence >= threshold:
             return True
     
     return False

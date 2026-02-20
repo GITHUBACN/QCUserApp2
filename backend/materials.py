@@ -7,39 +7,53 @@ import os
 from backend import common
 
 cf_thrsd_dict = {
+
     "OCC_inventory": 55,
     "OCC_closeup": 55,
     "OCC_scale": 60,
     "OCC_unpacking": 55,
-    "DLK_inventory": 60,
-    "DLK_closeup": 55,
-    "DLK_scale": 70,
-    "DLK_unpacking": 55,
     "MIX_inventory": 70,
     "MIX_closeup": 55,
     "MIX_scale": 70,
-    "radiometer": 50,
-    "newWatermeter": 50,
-    "oldWatermeter": 50,
-    "floor": 55,
+    "WHITE_closeup": 55,
+    "WHITE_inventory": 55,
+    "WHITE_scale": 55,
+    "WHITE_unpacking": 55,
+    
+    # set very high, let model 1 identify the devices
+    "newWatermeter": 99,
+    "oldWatermeter": 99,
+    "radiometer": 99,
+
     "sign": 55,
-}
+    "floor": 55,
+  }
 
 class_to_dir = {
-    "OCC - inventory": r"classified/OCC/1. 堆場",
-    "OCC - closeup": r"classified/OCC/2. 貨包",
-    "OCC - radiometer - closeup": r"classified/OCC/4. 輻射儀貨包",
-    "OCC - scale": r"classified/OCC/5. 地面秤重",
-    "OCC - newWatermeter": r"classified/OCC/7. 新款水分儀",
-    "OCC - oldWatermeter": r"classified/OCC/7. 水分儀",
-    "OCC - unpacking": r"classified/OCC/8. 拆包",
-    "MIX - inventory": r"classified/MIX/1. 堆場",
-    "MIX - closeup": r"classified/MIX/2. 貨包",
-    "MIX - radiometer - closeup": r"classified/MIX/4. 輻射儀貨包",
-    "MIX - scale": r"classified/MIX/5. 地面秤重",
-    "MIX - newWatermeter": r"classified/MIX/7. 新款水分儀",
-    "MIX - oldWatermeter": r"classified/MIX/7. 水分儀",
-    "MIX - unpacking": r"classified/MIX/8. 拆包",
+    "OCC - inventory": r"classified/1.堆場 4070-10 OCC",
+    "OCC - closeup": r"classified/2.貨包 4070-10 OCC",
+    "OCC - radiometer - closeup": r"classified/4.輻射儀貨包 4070-10 OCC",
+    "OCC - scale": r"classified/5.地面秤重 4070-10 OCC",
+    "OCC - newWatermeter": r"classified/7.新款水分儀 4070-10 OCC",
+    "OCC - oldWatermeter": r"classified/7.水分儀 4070-10 OCC",
+    "OCC - unpacking": r"classified/8.拆包 4070-10 OCC",
+
+    "MIX - inventory": r"classified/1.堆場 4070-30 MIX",
+    "MIX - closeup": r"classified/2.貨包 4070-30 MIX",
+    "MIX - radiometer - closeup": r"classified/4.輻射儀貨包 4070-30 MIX",
+    "MIX - scale": r"classified/5.地面秤重 4070-30 MIX",
+    "MIX - newWatermeter": r"classified/7.新款水分儀 4070-30 MIX",
+    "MIX - oldWatermeter": r"classified/7.水分儀 4070-30 MIX",
+    "MIX - unpacking": r"classified/8.拆包 4070-30 MIX",
+
+    "WHITE - inventory": r"classified/1.堆場 4070-20 WHITE",
+    "WHITE - closeup": r"classified/2.貨包 4070-20 WHITE",
+    "WHITE - radiometer - closeup": r"classified/4.輻射儀貨包 4070-20 WHITE",
+    "WHITE - scale": r"classified/5.地面秤重 4070-20 WHITE",
+    "WHITE - newWatermeter": r"classified/7.新款水分儀 4070-20 WHITE",
+    "WHITE - oldWatermeter": r"classified/7.水分儀 4070-20 WHITE",
+    "WHITE - unpacking": r"classified/8.拆包 4070-20 WHITE",
+
     "radiometer - floor": r"classified/4. 輻射儀地面",
     "unknown": r"classified/unknown",
 }
@@ -54,7 +68,7 @@ material_device_translate = {
 def _classify_one(labels: list) -> tuple:
     material_locations = [
         "OCC_inventory", "OCC_closeup", "OCC_scale", "OCC_unpacking",
-        "DLK_inventory", "DLK_closeup", "DLK_scale", "DLK_unpacking",
+        "WHITE_inventory", "WHITE_closeup", "WHITE_scale", "WHITE_unpacking",
         "MIX_inventory", "MIX_closeup", "MIX_scale",
     ]
     objects = ["sign", "radiometer", "oldWatermeter", "newWatermeter"]
@@ -102,7 +116,6 @@ def _classify_one(labels: list) -> tuple:
 def _classify_name(pred_material, pred_object: str, pred_extra: list) -> str:
     if not pred_material:
         return "unknown"
-    pred_material = pred_material.replace("DLK", "OCC")
 
     if "Watermeter" in pred_object:
         pred_material = pred_material.split("_")[0]
