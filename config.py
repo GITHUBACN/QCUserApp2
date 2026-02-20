@@ -99,7 +99,8 @@ def _load_text_reading_prompt() -> str:
 
     # Minimal safe default that matches the notebook contract.
     return (
-        "You are reading digits from photos of paper signs and device screens.\n"
+        "You are reading digits from photos of paper signs and device screens."
+        "Flag if the digits or text is not clear.\n"
         "Return a brief reasoning, then on the last line output \"{digit/HSCODE} - {flagged/None}\"."
     )
 
