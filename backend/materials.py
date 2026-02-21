@@ -131,7 +131,7 @@ def _classify_name(pred_material, pred_object: str, pred_extra: list) -> str:
     if "scale" in pred_material and "sign" in pred_object:
         pred_material = pred_material.split("_")[0]
         return pred_material + " - " + "scale"
-    if "inventory" in pred_material and "sign" in pred_object:
+    if "inventory" in pred_material:
         pred_material = pred_material.split("_")[0]
         return pred_material + " - " + "inventory"
     pred_material = pred_material.split("_")[0]
