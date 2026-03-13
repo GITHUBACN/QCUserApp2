@@ -24,8 +24,8 @@ cf_thrsd_dict = {
     "newWatermeter": 99,
     "oldWatermeter": 99,
     "radiometer": 99,
+    "sign": 99,
 
-    "sign": 55,
     "floor": 55,
   }
 
@@ -62,6 +62,7 @@ material_device_translate = {
     "7_MOISTURE": "oldWatermeter",
     "NEW_MOISTURE": "newWatermeter",
     "RADIATION": "radiometer",
+    "sign": "sign",
 }
 
 

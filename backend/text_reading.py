@@ -6,6 +6,7 @@ This module is backend-only (no Streamlit).
 """
 import io
 import os
+import re
 from typing import Iterable, Tuple
 
 import boto3
@@ -148,24 +149,61 @@ def _parse_text_reading_output(raw_text: str) -> Tuple[str, bool]:
     Parse the model output.
 
     Expectation: a final line like "{digit/HSCODE} - {flagged/None}".
-    Returns (digit_without_HSCODE, flagged_bool).
+    Returns (clean_digit_or_hscode, flagged_bool).
+
+    - For meter readings ("digit" case): returns only the numeric part
+      (digits, optionally with a decimal point), with no words.
+    - For HSCODE cases: returns a normalized string like "HSCODE 4707.x0"
+      when we can confidently detect it (e.g. "HSCODE 4707.90").
     """
     if not raw_text:
         return "", False
 
+    # Take the last non-empty line as the structured output line.
     lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
-    last = lines[-1] if lines else ""
-    if " - " not in last:
+    if not lines:
         return "", False
+    last = lines[-1]
 
-    left, right = last.split(" - ", 1)
-    digit = left.strip()
-    if digit.upper().startswith("HSCODE"):
-        parts = digit.split(maxsplit=1)
-        digit = parts[1] if len(parts) == 2 else ""
+    # Determine flagged status from the last line, independent of exact format.
+    lowered = last.lower()
+    flagged = "flagged" in lowered
 
-    flagged_str = right.strip().lower()
-    flagged = "flagged" in flagged_str
+    # Prefer the part before " - " as the value area, but fall back to full line.
+    value_part = last
+    if " - " in last:
+        value_part, _ = last.split(" - ", 1)
+        value_part = value_part.strip()
+
+    # First, try to detect an explicit HSCODE pattern like "HSCODE 4707.x0".
+    # Accept small variations in spacing/case.
+    hs_match = re.search(
+        r"(HSCODE\s*\d{4}\.\d0)", value_part, flags=re.IGNORECASE
+    )
+    if hs_match:
+        # Normalize spacing and casing: "HSCODE 4707.x0"
+        raw_hs = hs_match.group(1).strip()
+        parts = raw_hs.split()
+        if len(parts) == 2:
+            return f"HSCODE {parts[1]}", flagged
+        return raw_hs.upper(), flagged
+
+    # If "HSCODE" appears but the strict pattern did not match (e.g. slightly
+    # different formatting), try to reconstruct "HSCODE <number>" from the text.
+    if "hscode" in value_part.lower():
+        # Extract the first numeric-like token after HSCODE.
+        after = value_part.split("HSCODE", 1)[1]
+        num_match = re.search(r"(\d{3,5}(?:\.\d+)?)", after)
+        if num_match:
+            return f"HSCODE {num_match.group(1)}", flagged
+        # Fall back to returning just "HSCODE" if we cannot find a number.
+        return "HSCODE", flagged
+
+    # At this point we assume it's a plain digit reading (no HSCODE).
+    # Strip any stray words and keep only the first numeric token (with optional decimal).
+    digit_match = re.search(r"(\d{1,4}(?:\.\d+)?)", value_part)
+    digit = digit_match.group(1) if digit_match else ""
+
     return digit, flagged
 
 
@@ -290,4 +328,3 @@ def add_text_reading_to_jsons(
         current += 1
         if progress_callback:
             progress_callback(current, total, f"Processed {current}/{total} images for text_reading")
-
