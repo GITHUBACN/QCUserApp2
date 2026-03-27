@@ -344,13 +344,13 @@ def _range_key_for_cached(cached: dict) -> str | None:
     return None
 
 
-def copy_out_of_range_and_flagged_to_reject(
+def move_out_of_range_and_flagged_to_reject(
     input_folder: str,
     output_path: str,
     legal_range: dict[str, tuple[float, float]] | None = None,
 ) -> None:
     """
-    Copy images whose digit reading is out of range OR flagged == True to a
+    Move images whose digit reading is out of range OR flagged == True to a
     reject folder under output_path.
 
     - legal_range: mapping like
@@ -413,6 +413,7 @@ def copy_out_of_range_and_flagged_to_reject(
             image_bytes = common.compress_image(img)
             with open(os.path.join(reject_dir, f"{base}.jpg"), "wb") as f:
                 f.write(image_bytes)
+            os.remove(img_path)
         except Exception as e:
             print(f"Failed to copy {base} to reject folder: {e}")
 
