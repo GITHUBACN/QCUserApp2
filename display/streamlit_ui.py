@@ -85,8 +85,8 @@ def run_classification_pipeline(config, client, files: list, folder_input: str, 
         from backend.text_reading import (
             add_text_reading_to_jsons,
             correct_materials_with_hscode,
-            copy_out_of_range_and_flagged_to_reject,
-        )
+            move_out_of_range_and_flagged_to_reject,
+        )   
 
         text_config = get_text_reading_config()
         message_placeholder.write("Running text reading on images with target labels...")
@@ -104,7 +104,7 @@ def run_classification_pipeline(config, client, files: list, folder_input: str, 
 
         # Copy out-of-range or flagged digit readings to a reject folder.
         message_placeholder.write("Copying out-of-range or flagged readings to reject folder...")
-        copy_out_of_range_and_flagged_to_reject(
+        move_out_of_range_and_flagged_to_reject(
             input_folder=folder_input,
             output_path=folder_output,
         )
