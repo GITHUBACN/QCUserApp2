@@ -39,7 +39,7 @@ def main() -> None:
         and model1_status == "RUNNING"
         and model2_status == "RUNNING"
     )
-    if ui.render_start_button(disabled=False) and client is not None:
+    if ui.render_start_button(disabled=not can_start) and client is not None:
         ui.run_classification_pipeline(config, client, files, folder_input, folder_output)
 
 
