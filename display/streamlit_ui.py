@@ -82,7 +82,11 @@ def run_classification_pipeline(config, client, files: list, folder_input: str, 
     # Run text reading after classification completes
     try:
         from config import get_text_reading_config
-        from backend.text_reading import add_text_reading_to_jsons
+        from backend.text_reading import (
+            add_text_reading_to_jsons,
+            correct_materials_with_hscode,
+            copy_out_of_range_and_flagged_to_reject,
+        )
 
         text_config = get_text_reading_config()
         message_placeholder.write("Running text reading on images with target labels...")
@@ -92,6 +96,17 @@ def run_classification_pipeline(config, client, files: list, folder_input: str, 
             text_config=text_config,
             aws_profile=config.aws_profile,
             progress_callback=progress_callback,
+        )
+        # Use HSCODE readings (if present) to correct material classifications
+        # before copying images into their final classified folders.
+        message_placeholder.write("Correcting material classes using HSCODE readings...")
+        correct_materials_with_hscode(output_path=folder_output)
+
+        # Copy out-of-range or flagged digit readings to a reject folder.
+        message_placeholder.write("Copying out-of-range or flagged readings to reject folder...")
+        copy_out_of_range_and_flagged_to_reject(
+            input_folder=folder_input,
+            output_path=folder_output,
         )
     except Exception as e:
         # Text reading is optional; log but don't fail the pipeline

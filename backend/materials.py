@@ -62,7 +62,12 @@ material_device_translate = {
     "7_MOISTURE": "oldWatermeter",
     "NEW_MOISTURE": "newWatermeter",
     "RADIATION": "radiometer",
-    "sign": "sign",
+    "PAPER_SIGN": "sign",
+}
+
+material_specialCase_translate = {
+    "MIX_inventory_closeup": "MIX_inventory",
+    "MIX_closeup_OCC": "MIX_closeup",
 }
 
 
@@ -72,7 +77,7 @@ def _classify_one(labels: list) -> tuple:
         "WHITE_inventory", "WHITE_closeup", "WHITE_scale", "WHITE_unpacking",
         "MIX_inventory", "MIX_closeup", "MIX_scale",
     ]
-    objects = ["sign", "radiometer", "oldWatermeter", "newWatermeter"]
+    objects = material_device_translate.keys()
     extras_list = ["floor"]
 
     pred_material = None
@@ -82,6 +87,8 @@ def _classify_one(labels: list) -> tuple:
     object_cf = 0
 
     for label in labels:
+        if label["Name"] in material_specialCase_translate:
+            label["Name"] = material_specialCase_translate[label["Name"]]
         if (
             label["Name"] in material_locations
             and label["Confidence"] > cf_thrsd_dict.get(label["Name"], 0)
@@ -95,7 +102,7 @@ def _classify_one(labels: list) -> tuple:
             and label["Confidence"] > object_cf
         ):
             object_cf = label["Confidence"]
-            pred_object = label["Name"]
+            pred_object = material_device_translate.get(label["Name"], label["Name"])
         elif (
             label["Name"] in extras_list
             and label["Confidence"] > cf_thrsd_dict.get(label["Name"], 0)
@@ -135,6 +142,10 @@ def _classify_name(pred_material, pred_object: str, pred_extra: list) -> str:
     if "inventory" in pred_material:
         pred_material = pred_material.split("_")[0]
         return pred_material + " - " + "inventory"
+    # labeled unpacking and sign at the same time, mark as closeup
+    if "unpacking" in pred_material and "sign" in pred_object:
+        pred_material = pred_material.split("_")[0]
+        return pred_material + " - " + "closeup"
     pred_material = pred_material.split("_")[0]
     return pred_material + " - " + "unpacking"
 
@@ -176,6 +187,7 @@ def classify_materials(
                     client, model_arn, image_bytes, min_confidence=10
                 )
                 pred_material, pred_object, pred_extra = _classify_one(labels)
+                # labels passed from scales.py will override the pred_object
                 if uploaded_file in material_device_list:
                     pred_object = material_device_translate.get(
                         material_device_list[uploaded_file], pred_object

@@ -24,6 +24,20 @@ TEXT_READING_THRESHOLDS = {
     "LCD_SCREEN": 60.0,
 }
 
+# Legal digit ranges per device/scale category.
+# Keys are matched against scale_class or material_class:
+#   - "6_": any scale_class starting with "6_"
+#   - "9_": any scale_class starting with "9_"
+#   - "radiometer": any material_class containing "radiometer"
+#   - "Watermeter": any material_class containing "Watermeter"
+# Values are (min_inclusive, max_inclusive) tuples.
+LEGAL_DIGIT_RANGE: dict[str, tuple[float, float]] = {
+    "6_": (700, 2000),
+    "9_": (700, 2000),
+    "radiometer": (0.1, 0.25),
+    "Watermeter": (0.1, 12),
+}
+
 
 def _get_bedrock_client(region: str, profile_name: str | None = None):
     """
@@ -205,6 +219,202 @@ def _parse_text_reading_output(raw_text: str) -> Tuple[str, bool]:
     digit = digit_match.group(1) if digit_match else ""
 
     return digit, flagged
+
+
+def _parse_hscode_to_material(hscode_text: str) -> tuple[str | None, str | None]:
+    """
+    Normalize flexible HSCODE text to a canonical code and material type.
+
+    Rules:
+    - Ignore casing, spaces, and punctuation (accept \"HS CODE\", \"HSCODE\", \"470710\",
+      \"4707. 10\", etc.).
+    - Only accept codes that normalize to 4707.10, 4707.20, or 4707.30.
+      * 4707.10 -> OCC
+      * 4707.20 -> WHITE
+      * 4707.30 -> MIX
+    - Reject everything else (return (None, None)).
+    """
+    if not hscode_text:
+        return None, None
+
+    # Remove any leading HSCODE / HS CODE text for robustness.
+    lowered = hscode_text.lower()
+    lowered = re.sub(r"hs\s*code", "", lowered)
+    lowered = re.sub(r"hscode", "", lowered)
+
+    # Keep only digits to ignore spaces and punctuation.
+    digits = "".join(ch for ch in lowered if ch.isdigit())
+    if len(digits) < 6:
+        return None, None
+
+    # Require 4707 as the prefix.
+    if not digits.startswith("4707"):
+        return None, None
+
+    # Take last two digits as the code suffix.
+    suffix = digits[-2:]
+    code_map = {
+        "10": "OCC",
+        "20": "WHITE",
+        "30": "MIX",
+    }
+    material_type = code_map.get(suffix)
+    if not material_type:
+        return None, None
+
+    normalized_code = f"4707.{suffix}"
+    return normalized_code, material_type
+
+
+def correct_materials_with_hscode(output_path: str) -> None:
+    """
+    Use HSCODE readings in the text_reading cache to correct material_class.
+
+    For each cached image:
+      - If text_reading.digit encodes a valid HSCODE (4707.10/20/30 in flexible formats),
+        map to OCC/WHITE/MIX.
+      - If current material_class has a different type (OCC/MIX/WHITE), rewrite it to use
+        the HSCODE-derived type but keep the same position (inventory/closeup/scale/...).
+      - If the code is invalid or non-4707.xx, do nothing.
+    """
+    json_dir = os.path.join(output_path, "json")
+    if not os.path.isdir(json_dir):
+        return
+
+    for base in _iter_json_basenames(output_path):
+        cached = common.get_cached_labels(output_path, base)
+        text_reading = cached.get("text_reading") or {}
+        digit = text_reading.get("digit") or ""
+        if not digit:
+            continue
+
+        # Only consider entries that look like they might contain an HSCODE.
+        if "hscode" not in digit.lower() and not any(ch.isdigit() for ch in digit):
+            continue
+
+        normalized_code, desired_type = _parse_hscode_to_material(digit)
+        if not normalized_code or not desired_type:
+            # Reject non-4707.xx codes or unsupported suffixes.
+            continue
+
+        material_class = cached.get("material_class")
+        if not isinstance(material_class, str) or not material_class:
+            continue
+
+        # Expect material_class like "OCC - inventory"
+        m = re.match(r"^(\w+)\s*-\s*(.+)$", material_class)
+        if not m:
+            continue
+
+        current_type, position = m.group(1), m.group(2)
+        if current_type not in {"OCC", "MIX", "WHITE"}:
+            # Do not override non-paper or unknown types.
+            continue
+
+        if current_type == desired_type:
+            # Already consistent with HSCODE.
+            continue
+
+        new_material_class = f"{desired_type} - {position}"
+        common.save_cached_labels(output_path, base, material_class=new_material_class)
+
+
+def _range_key_for_cached(cached: dict) -> str | None:
+    """
+    Determine which legal range key applies to this cached record, based on
+    its scale_class and material_class.
+    """
+    material_class = cached.get("material_class") or ""
+    scale_class = cached.get("scale_class") or ""
+
+    # Device-based ranges from material_class
+    lower_mat = material_class.lower()
+    if "radiometer" in lower_mat:
+        return "radiometer"
+    if "watermeter" in lower_mat:
+        return "Watermeter"
+
+    # Scale-based ranges from scale_class (e.g. "6_IT_0", "9_WA_0")
+    if isinstance(scale_class, str):
+        if scale_class.startswith("6_"):
+            return "6_"
+        if scale_class.startswith("9_"):
+            return "9_"
+
+    return None
+
+
+def copy_out_of_range_and_flagged_to_reject(
+    input_folder: str,
+    output_path: str,
+    legal_range: dict[str, tuple[float, float]] | None = None,
+) -> None:
+    """
+    Copy images whose digit reading is out of range OR flagged == True to a
+    reject folder under output_path.
+
+    - legal_range: mapping like
+        {"6_": (min, max), "9_": (min, max), "radiometer": (min, max), "Watermeter": (min, max)}
+      If None, uses the module-level LEGAL_DIGIT_RANGE.
+    - HSCODE readings are ignored for range checks (but still moved if flagged).
+    """
+    legal_range = legal_range or LEGAL_DIGIT_RANGE
+
+    json_dir = os.path.join(output_path, "json")
+    if not os.path.isdir(json_dir):
+        return
+
+    reject_dir = os.path.join(output_path, "reject")
+    os.makedirs(reject_dir, exist_ok=True)
+
+    for base in _iter_json_basenames(output_path):
+        cached = common.get_cached_labels(output_path, base)
+        text_reading = cached.get("text_reading") or {}
+        digit_str = text_reading.get("digit") or ""
+        flagged = bool(text_reading.get("flagged"))
+
+        # If nothing to evaluate and not flagged, skip.
+        if not digit_str and not flagged:
+            continue
+
+        # Determine if this record should be rejected.
+        reject = False
+
+        # Flagged readings always go to reject.
+        # turn this off for now
+        # if flagged:
+        #     reject = True
+
+        # Range check only applies to numeric digit readings, not HSCODE.
+        if not digit_str.upper().startswith("HSCODE"):
+            range_key = _range_key_for_cached(cached)
+            if range_key and range_key in legal_range:
+                # Extract first numeric token from the digit string.
+                num_match = re.search(r"(\d+(?:\.\d+)?)", str(digit_str))
+                if num_match:
+                    try:
+                        value = float(num_match.group(1))
+                        min_v, max_v = legal_range[range_key]
+                        if not (min_v <= value <= max_v):
+                            reject = True
+                    except ValueError:
+                        # Unparsable numeric -> treat as reject for safety.
+                        reject = True
+
+        if not reject:
+            continue
+
+        img_path = _resolve_image_path(input_folder, base)
+        if not img_path:
+            continue
+
+        try:
+            img = Image.open(img_path).convert("RGB")
+            image_bytes = common.compress_image(img)
+            with open(os.path.join(reject_dir, f"{base}.jpg"), "wb") as f:
+                f.write(image_bytes)
+        except Exception as e:
+            print(f"Failed to copy {base} to reject folder: {e}")
 
 
 def _iter_json_basenames(output_path: str) -> Iterable[str]:

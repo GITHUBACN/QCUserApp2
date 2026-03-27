@@ -47,7 +47,7 @@ class_to_dir = {
     "unknown_device": r"classified/unknown_device",
 }
 
-material_devices = ["7_MOISTURE", "NEW_MOISTURE", "RADIATION", "sign"]
+material_devices = ["7_MOISTURE", "NEW_MOISTURE", "RADIATION", "PAPER_SIGN"]
 extras = ["FLOOR", "OCC_PAPER", "MIX_PAPER", "WHITE_PAPER", "NON_PAPER_MATERIAL", "HAND"]
 
 
