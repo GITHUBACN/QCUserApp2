@@ -7,6 +7,8 @@ This module is backend-only (no Streamlit).
 import io
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, Tuple
 
 import boto3
@@ -156,6 +158,33 @@ def _invoke_bedrock(
         if "text" in part:
             return part["text"]
     return ""
+
+
+def _process_text_reading_worker(
+    base: str,
+    img_path: str,
+    scale_labels: list,
+    prompt: str,
+    model_id: str,
+    region: str,
+    aws_profile: str | None,
+    local_state,
+) -> dict:
+    """
+    Run one text-reading inference and return a structured result payload.
+    """
+    try:
+        if not hasattr(local_state, "client"):
+            local_state.client = _get_bedrock_client(region=region, profile_name=aws_profile)
+
+        cropped = _cropped_image_from_rekognition(img_path, scale_labels)
+        img_bytes = common.compress_image(cropped)
+        conversation = _construct_conversation(prompt, img_bytes)
+        raw = _invoke_bedrock(local_state.client, model_id, conversation)
+        digit, flagged = _parse_text_reading_output(raw)
+        return {"base": base, "digit": digit, "flagged": bool(flagged), "error": None}
+    except Exception as e:
+        return {"base": base, "digit": "", "flagged": False, "error": str(e)}
 
 
 def _parse_text_reading_output(raw_text: str) -> Tuple[str, bool]:
@@ -493,11 +522,12 @@ def add_text_reading_to_jsons(
 
     This does not modify any Streamlit UI.
     """
-    client = _get_bedrock_client(region=text_config.region, profile_name=aws_profile)
-
     basenames = list(_iter_json_basenames(output_path))
     total = len(basenames)
     current = 0
+    local_state = threading.local()
+    max_workers = max(1, int(getattr(text_config, "max_workers", 4)))
+    pending_jobs: list[tuple[str, str, list]] = []
 
     for base in basenames:
         cached = common.get_cached_labels(output_path, base)
@@ -524,18 +554,37 @@ def add_text_reading_to_jsons(
             continue
 
         scale_labels = cached.get("scale_labels", [])
-        try:
-            cropped = _cropped_image_from_rekognition(img_path, scale_labels)
-            img_bytes = common.compress_image(cropped)
-            conversation = _construct_conversation(text_config.prompt, img_bytes)
-            raw = _invoke_bedrock(client, text_config.model_id, conversation)
-            digit, flagged = _parse_text_reading_output(raw)
-            text_reading = {"digit": digit, "flagged": bool(flagged)}
-            common.save_cached_labels(output_path, base, text_reading=text_reading)
-        except Exception as e:
-            # Log to stdout; callers can inspect JSONs later.
-            print(f"text_reading failed for {base}: {e}")
+        pending_jobs.append((base, img_path, scale_labels))
 
-        current += 1
-        if progress_callback:
-            progress_callback(current, total, f"Processed {current}/{total} images for text_reading")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_base = {
+            executor.submit(
+                _process_text_reading_worker,
+                base,
+                img_path,
+                scale_labels,
+                text_config.prompt,
+                text_config.model_id,
+                text_config.region,
+                aws_profile,
+                local_state,
+            ): base
+            for base, img_path, scale_labels in pending_jobs
+        }
+
+        for future in as_completed(future_to_base):
+            base = future_to_base[future]
+            try:
+                result = future.result()
+                if result.get("error"):
+                    # Log to stdout; callers can inspect JSONs later.
+                    print(f"text_reading failed for {base}: {result['error']}")
+                else:
+                    text_reading = {"digit": result["digit"], "flagged": bool(result["flagged"])}
+                    common.save_cached_labels(output_path, base, text_reading=text_reading)
+            except Exception as e:
+                print(f"text_reading failed for {base}: {e}")
+
+            current += 1
+            if progress_callback:
+                progress_callback(current, total, f"Processed {current}/{total} images for text_reading")
