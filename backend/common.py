@@ -11,11 +11,11 @@ from PIL import Image
 
 
 def compress_image(img, max_size: int = 1024, quality: int = 85) -> bytes:
-    """Compress the image to be under max_size (max dimension in pixels). Returns JPEG bytes."""
+    """Encode as JPEG. If max_size > 0, downscale so the longest side is at most max_size px."""
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
     w, h = img.size
-    if max(w, h) > max_size:
+    if max_size > 0 and max(w, h) > max_size:
         scale = max_size / max(w, h)
         new_w = int(w * scale)
         new_h = int(h * scale)
@@ -115,6 +115,17 @@ def _resolve_image_path(input_folder: str, base: str) -> str | None:
     return None
 
 
+def _rotate_by_text_reading(img: Image.Image, rotation: str) -> Image.Image:
+    """Rotate image to upright using text_reading rotation label."""
+    if rotation == "counterClockwise":
+        return img.rotate(90, expand=True)
+    if rotation == "clockwise":
+        return img.rotate(270, expand=True)
+    if rotation == "upsideDown":
+        return img.rotate(180, expand=True)
+    return img
+
+
 def copy_images_to_classified_folders(
     output_path: str,
     input_folder: str,
@@ -158,6 +169,9 @@ def copy_images_to_classified_folders(
             continue
         os.makedirs(full_save_path, exist_ok=True)
         img = Image.open(img_path).convert("RGB")
+        text_reading = cached.get("text_reading") or {}
+        rotation = text_reading.get("rotation") or ""
+        img = _rotate_by_text_reading(img, rotation)
         image_bytes = compress_image(img)
         with open(os.path.join(full_save_path, f"{base}.jpg"), "wb") as f:
             f.write(image_bytes)

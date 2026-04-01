@@ -72,6 +72,9 @@ class TextReadingConfig(NamedTuple):
     prompt: str
     model_id: str
     region: str
+    max_tokens: int
+    temperature: float
+    max_workers: int
 
 
 def _load_text_reading_prompt() -> str:
@@ -113,4 +116,14 @@ def get_text_reading_config() -> TextReadingConfig:
     prompt = _load_text_reading_prompt()
     model_id = os.getenv("BEDROCK_MODEL_ID", "us.meta.llama3-2-90b-instruct-v1:0").strip()
     region = os.getenv("BEDROCK_REGION", "us-east-2").strip()
-    return TextReadingConfig(prompt=prompt, model_id=model_id, region=region)
+    max_tokens = int(os.getenv("TEXT_READING_MAX_TOKENS", "1500"))
+    temperature = float(os.getenv("TEXT_READING_TEMPERATURE", "0"))
+    max_workers = int(os.getenv("TEXT_READING_MAX_WORKERS", "4"))
+    return TextReadingConfig(
+        prompt=prompt,
+        model_id=model_id,
+        region=region,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        max_workers=max_workers,
+    )

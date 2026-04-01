@@ -3,6 +3,7 @@ Material classification. No Streamlit.
 Uses unified cache: check material_labels before calling API.
 """
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from backend import common
 
@@ -150,6 +151,43 @@ def _classify_name(pred_material, pred_object: str, pred_extra: list) -> str:
     return pred_material + " - " + "unpacking"
 
 
+def _run_material_inference_worker(
+    client,
+    model_arn: str,
+    uploaded_file: str,
+    base: str,
+    scale_override: str | None,
+) -> dict:
+    """Run one material inference and return a structured payload."""
+    from PIL import Image
+
+    try:
+        with Image.open(uploaded_file) as img:
+            image_bytes = common.compress_image(img)
+        labels = common.show_custom_labels(
+            client, model_arn, image_bytes, min_confidence=10
+        )
+        pred_material, pred_object, pred_extra = _classify_one(labels)
+        if scale_override:
+            pred_object = material_device_translate.get(scale_override, pred_object)
+        result = _classify_name(pred_material, pred_object, pred_extra)
+        return {
+            "uploaded_file": uploaded_file,
+            "base": base,
+            "labels": labels,
+            "result": result,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "uploaded_file": uploaded_file,
+            "base": base,
+            "labels": [],
+            "result": None,
+            "error": str(e),
+        }
+
+
 def classify_materials(
     client,
     model_arn: str,
@@ -157,48 +195,62 @@ def classify_materials(
     material_device_list: dict,
     output_path: str,
     progress_callback=None,
+    max_workers: int = 4,
 ) -> None:
     """
     Run material classification. Uses unified cache: if material_labels exist, skip API.
     progress_callback(current, total, message) is optional.
     """
-    from PIL import Image
-
     total = len([
         p for p in uploaded_files_list
         if p[-4:].lower() in (".jpg", ".jpeg", ".png")
     ])
     current = 0
+    worker_count = max(1, int(max_workers))
+    pending_jobs: list[tuple[str, str, str | None]] = []
 
     for uploaded_file in uploaded_files_list:
         if uploaded_file[-4:].lower() not in (".jpg", ".jpeg", ".png"):
             continue
 
         filename = os.path.basename(uploaded_file)
-        base = filename[:-4]
+        base = os.path.splitext(filename)[0]
         cached = common.get_cached_labels(output_path, base)
 
         if cached.get("material_labels"):
-            pass  # already classified
+            current += 1
+            if progress_callback:
+                progress_callback(current, total, f"Classifying {current}/{total} files...")
         else:
-            image_bytes = common.compress_image(Image.open(uploaded_file))
-            try:
-                labels = common.show_custom_labels(
-                    client, model_arn, image_bytes, min_confidence=10
-                )
-                pred_material, pred_object, pred_extra = _classify_one(labels)
-                # labels passed from scales.py will override the pred_object
-                if uploaded_file in material_device_list:
-                    pred_object = material_device_translate.get(
-                        material_device_list[uploaded_file], pred_object
-                    )
-                result = _classify_name(pred_material, pred_object, pred_extra)
-                common.save_cached_labels(
-                    output_path, base, material_labels=labels, material_class=result
-                )
-            except Exception as e:
-                print("Classify Failed:", e)
+            pending_jobs.append((uploaded_file, base, material_device_list.get(uploaded_file)))
 
-        current += 1
-        if progress_callback:
-            progress_callback(current, total, f"Classifying {current}/{total} files...")
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(
+                _run_material_inference_worker,
+                client,
+                model_arn,
+                uploaded_file,
+                base,
+                scale_override,
+            ): uploaded_file
+            for uploaded_file, base, scale_override in pending_jobs
+        }
+
+        for future in as_completed(future_map):
+            result_payload = future.result()
+            base = result_payload["base"]
+
+            if result_payload["error"]:
+                print("Classify Failed:", result_payload["error"])
+            else:
+                common.save_cached_labels(
+                    output_path,
+                    base,
+                    material_labels=result_payload["labels"],
+                    material_class=result_payload["result"],
+                )
+
+            current += 1
+            if progress_callback:
+                progress_callback(current, total, f"Classifying {current}/{total} files...")

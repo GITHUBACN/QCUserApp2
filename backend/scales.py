@@ -3,6 +3,7 @@ Scale/device classification. No Streamlit.
 Uses unified cache: check scale_labels before calling API.
 """
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image, ExifTags
 import cv2
 
@@ -126,12 +127,44 @@ def _save_scale_result(
     )
 
 
+def _run_scale_inference_worker(
+    client,
+    model_arn: str,
+    uploaded_file: str,
+    base: str,
+) -> dict:
+    """Run one scale inference and return a structured payload."""
+    try:
+        image_pil = _smart_fix_orientation(uploaded_file)
+        image_bytes = common.compress_image(image_pil)
+        labels = common.show_custom_labels(
+            client, model_arn, image_bytes, min_confidence=75
+        )
+        result = _classify_name(labels)
+        return {
+            "uploaded_file": uploaded_file,
+            "base": base,
+            "labels": labels,
+            "result": result,
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "uploaded_file": uploaded_file,
+            "base": base,
+            "labels": [],
+            "result": None,
+            "error": str(e),
+        }
+
+
 def classify_scales(
     client,
     model_arn: str,
     file_paths: list,
     output_path: str,
     progress_callback=None,
+    max_workers: int = 4,
 ) -> tuple[list, dict]:
     """
     Run scale classification. Returns (toNextStage, material_device_list).
@@ -142,12 +175,15 @@ def classify_scales(
     total = len([p for p in file_paths if p[-4:].lower() in (".jpg", ".jpeg", ".png")])
     current = 0
 
+    pending_jobs: list[tuple[str, str]] = []
+    worker_count = max(1, int(max_workers))
+
     for uploaded_file in file_paths:
         if uploaded_file[-4:].lower() not in (".jpg", ".jpeg", ".png"):
             continue
 
         filename = os.path.basename(uploaded_file)
-        base = filename[:-4]
+        base = os.path.splitext(filename)[0]
         cached = common.get_cached_labels(output_path, base)
 
         if cached.get("scale_labels"):
@@ -159,25 +195,43 @@ def classify_scales(
             elif result in material_devices:
                 toNextStage.append(uploaded_file)
                 material_device_list[uploaded_file] = result
+            current += 1
+            if progress_callback:
+                progress_callback(current, total, f"Classifying {current}/{total} files...")
         else:
-            image_pil = _smart_fix_orientation(uploaded_file)
-            image_bytes = common.compress_image(image_pil)
-            try:
-                labels = common.show_custom_labels(
-                    client, model_arn, image_bytes, min_confidence=75  # higher confidence for scale classification
-                )
-                result = _classify_name(labels)
+            pending_jobs.append((uploaded_file, base))
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(
+                _run_scale_inference_worker,
+                client,
+                model_arn,
+                uploaded_file,
+                base,
+            ): uploaded_file
+            for uploaded_file, base in pending_jobs
+        }
+
+        for future in as_completed(future_map):
+            result_payload = future.result()
+            uploaded_file = result_payload["uploaded_file"]
+            base = result_payload["base"]
+
+            if result_payload["error"]:
+                print("Classify Failed:", result_payload["error"])
+            else:
+                result = result_payload["result"]
+                labels = result_payload["labels"]
                 if result == "next_stage":
                     toNextStage.append(uploaded_file)
                 elif result in material_devices:
                     toNextStage.append(uploaded_file)
                     material_device_list[uploaded_file] = result
                 _save_scale_result(output_path, base, labels, result)
-            except Exception as e:
-                print("Classify Failed:", e)
 
-        current += 1
-        if progress_callback:
-            progress_callback(current, total, f"Classifying {current}/{total} files...")
+            current += 1
+            if progress_callback:
+                progress_callback(current, total, f"Classifying {current}/{total} files...")
 
     return toNextStage, material_device_list

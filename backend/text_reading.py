@@ -9,7 +9,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterable, Tuple
+from typing import Iterable
 
 import boto3
 from PIL import Image
@@ -40,20 +40,20 @@ LEGAL_DIGIT_RANGE: dict[str, tuple[float, float]] = {
     "Watermeter": (0.1, 12),
 }
 
+_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
+
 
 def _get_bedrock_client(region: str, profile_name: str | None = None):
     """
     Create a bedrock-runtime client.
 
-    Uses the same profile mechanism as the rest of the app when provided,
-    otherwise falls back to the default credential chain.
-    If AWS_BEARER_TOKEN_BEDROCK is set in the environment, the SDK uses it
-    for Bedrock auth (same as the playground notebook), bypassing IAM.
+    If AWS_BEARER_TOKEN_BEDROCK is set, use a plain boto3 client (same as crop.ipynb).
+    Otherwise fall back to an IAM profile when provided.
     """
-    # Normalize bearer token: strip quotes/whitespace so it starts with ABSK (required prefix)
     token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip().strip('"').strip("'")
     if token:
         os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
+        return boto3.client(service_name="bedrock-runtime", region_name=region)
     if profile_name:
         session = boto3.Session(profile_name=profile_name)
         return session.client(service_name="bedrock-runtime", region_name=region)
@@ -68,7 +68,7 @@ def _cropped_image_from_rekognition(
     min_height: int = 30,
 ) -> Image.Image:
     """
-    Crop the LCD screen area from the image using Rekognition labels.
+    Crop the highest-confidence LCD_SCREEN_0 / LCD_SCREEN_0_MAIN bbox.
     Falls back to the full image if no suitable label is found.
     """
     image = Image.open(image_path).convert("RGB")
@@ -92,7 +92,6 @@ def _cropped_image_from_rekognition(
         return image
 
     box = mx_label["Geometry"]["BoundingBox"]
-
     left = int(box["Left"] * img_w)
     top = int(box["Top"] * img_h)
     right = int((box["Left"] + box["Width"]) * img_w)
@@ -111,12 +110,15 @@ def _cropped_image_from_rekognition(
     return image.crop((left, top, right, bottom))
 
 
+def _image_to_jpeg_bytes(img: Image.Image) -> bytes:
+    """Encode a PIL image to JPEG bytes (quality 85, no resize) — same as crop.ipynb."""
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85, optimize=True)
+    return buf.getvalue()
+
+
 def _construct_conversation(prompt: str, image_bytes: bytes) -> list[dict]:
-    """
-    Build a Bedrock Converse conversation payload with one user message
-    containing text + image.
-    """
-    img_type = "jpeg"
+    """Build a Bedrock Converse payload with one user message containing text + image."""
     return [
         {
             "role": "user",
@@ -124,7 +126,7 @@ def _construct_conversation(prompt: str, image_bytes: bytes) -> list[dict]:
                 {"text": prompt},
                 {
                     "image": {
-                        "format": img_type,
+                        "format": "jpeg",
                         "source": {"bytes": image_bytes},
                     }
                 },
@@ -137,20 +139,16 @@ def _invoke_bedrock(
     client,
     model_id: str,
     conversation: list[dict],
-    max_tokens: int = 512,
-    temperature: float = 0.1,
-    top_p: float = 0.9,
+    max_tokens: int = 1500,
+    temperature: float = 0.0,
 ) -> str:
-    """
-    Call Bedrock converse API and return the text output.
-    """
+    """Call Bedrock Converse API and return the text output."""
     response = client.converse(
         modelId=model_id,
         messages=conversation,
         inferenceConfig={
             "maxTokens": max_tokens,
             "temperature": temperature,
-            "topP": top_p,
         },
     )
     content = response.get("output", {}).get("message", {}).get("content", [])
@@ -160,139 +158,184 @@ def _invoke_bedrock(
     return ""
 
 
+def _debug_save(img: Image.Image, img_bytes: bytes, base: str) -> None:
+    """
+    Optional debug: save the PIL crop and exact JPEG bytes sent to Bedrock.
+    Controlled by TEXT_READING_DEBUG_CROP_DIR (folder path) and
+    TEXT_READING_DEBUG_SHOW_CROP=1 (open system viewer).
+    """
+    out_dir = os.environ.get("TEXT_READING_DEBUG_CROP_DIR", "").strip()
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        img.save(os.path.join(out_dir, f"{base}_vlm_crop.jpg"), format="JPEG", quality=85, optimize=True)
+        with open(os.path.join(out_dir, f"{base}_vlm_request.jpg"), "wb") as f:
+            f.write(img_bytes)
+        print(f"[debug] saved crop + request JPEG for {base} → {out_dir}")
+
+    if os.environ.get("TEXT_READING_DEBUG_SHOW_CROP", "").strip().lower() in ("1", "true", "yes", "on"):
+        img.show(title=f"{base} VLM crop")
+
+
 def _process_text_reading_worker(
     base: str,
     img_path: str,
     scale_labels: list,
-    prompt: str,
-    model_id: str,
-    region: str,
+    text_config,
     aws_profile: str | None,
     local_state,
 ) -> dict:
-    """
-    Run one text-reading inference and return a structured result payload.
-    """
+    """Run one text-reading inference and return a structured result dict."""
     try:
         if not hasattr(local_state, "client"):
-            local_state.client = _get_bedrock_client(region=region, profile_name=aws_profile)
+            local_state.client = _get_bedrock_client(
+                region=text_config.region, profile_name=aws_profile
+            )
 
         cropped = _cropped_image_from_rekognition(img_path, scale_labels)
-        img_bytes = common.compress_image(cropped)
-        conversation = _construct_conversation(prompt, img_bytes)
-        raw = _invoke_bedrock(local_state.client, model_id, conversation)
-        digit, flagged = _parse_text_reading_output(raw)
-        return {"base": base, "digit": digit, "flagged": bool(flagged), "error": None}
+        img_bytes = _image_to_jpeg_bytes(cropped)
+        #_debug_save(cropped, img_bytes, base)
+
+        conversation = _construct_conversation(text_config.prompt, img_bytes)
+        raw = _invoke_bedrock(
+            local_state.client,
+            text_config.model_id,
+            conversation,
+            max_tokens=text_config.max_tokens,
+            temperature=text_config.temperature,
+        )
+        digit, rotation, flagged = _parse_text_reading_output(raw)
+        return {"base": base, "digit": digit, "rotation": rotation, "flagged": bool(flagged), "error": None}
     except Exception as e:
-        return {"base": base, "digit": "", "flagged": False, "error": str(e)}
+        return {"base": base, "digit": "", "rotation": "", "flagged": False, "error": str(e)}
 
 
-def _parse_text_reading_output(raw_text: str) -> Tuple[str, bool]:
+def _parse_text_reading_output(raw_text: str):
     """
     Parse the model output.
 
-    Expectation: a final line like "{digit/HSCODE} - {flagged/None}".
-    Returns (clean_digit_or_hscode, flagged_bool).
+    Expected final line: "{digit/HSCODE} - {rotation} - {flagged/None}".
+    Returns (clean_digit_or_hscode, rotation, flagged_bool).
 
-    - For meter readings ("digit" case): returns only the numeric part
-      (digits, optionally with a decimal point), with no words.
-    - For HSCODE cases: returns a normalized string like "HSCODE 4707.x0"
-      when we can confidently detect it (e.g. "HSCODE 4707.90").
+    rotation is one of upStraight, counterClockwise, clockwise, upsideDown
+    when recognized (spacing/case variants are normalized).
     """
     if not raw_text:
-        return "", False
+        return "", "", False
 
-    # Take the last non-empty line as the structured output line.
+    _ROT_MAP = {
+        "upstraight": "upStraight",
+        "counterclockwise": "counterClockwise",
+        "clockwise": "clockwise",
+        "upsidedown": "upsideDown",
+        "ccw": "counterClockwise",
+        "cw": "clockwise",
+    }
+
+    _KNOWN_ROTATION = frozenset(
+        {"upStraight", "counterClockwise", "clockwise", "upsideDown"}
+    )
+
+    def _compact(s: str) -> str:
+        return re.sub(r"[\s_-]+", "", s.strip().lower())
+
+    def _canonical_rotation(tok: str) -> str:
+        """Only return a known rotation; never echo stray tokens like HSCODE."""
+        if not tok or not tok.strip():
+            return ""
+        c = _compact(tok)
+        if c in _ROT_MAP:
+            return _ROT_MAP[c]
+        t = tok.strip()
+        return t if t in _KNOWN_ROTATION else ""
+
+    def _parse_value(value_part: str) -> str:
+        if not value_part:
+            return ""
+        hs_match = re.search(r"(HSCODE\s*\d{4}\.\d0)", value_part, flags=re.IGNORECASE)
+        if hs_match:
+            raw_hs = hs_match.group(1).strip()
+            parts = raw_hs.split()
+            if len(parts) == 2:
+                return f"HSCODE {parts[1]}"
+            return raw_hs.upper()
+        if "hscode" in value_part.lower():
+            after = value_part.split("HSCODE", 1)[1]
+            num_match = re.search(r"(\d{3,5}(?:\.\d+)?)", after)
+            if num_match:
+                return f"HSCODE {num_match.group(1)}"
+            return "HSCODE"
+        digit_match = re.search(r"(\d{1,4}(?:\.\d+)?)", value_part)
+        return digit_match.group(1) if digit_match else ""
+
+    def _normalize_line(line: str) -> str:
+        return line.strip().replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+
+    def _rotation_hint(line: str) -> str:
+        """Recover rotation from a free-text token when structured parsing fails."""
+        t = line.lower()
+        if re.search(r"counter\s*-?\s*clockwise|\bccw\b", t):
+            return "counterClockwise"
+        if re.search(r"\bupside\s*-?\s*down\b", t) or "upsidedown" in _compact(line):
+            return "upsideDown"
+        if re.search(r"\bup\s*-?\s*straight\b", t) or _compact(line).find("upstraight") >= 0:
+            return "upStraight"
+        if re.search(r"\bclockwise\b", t) and "counter" not in t:
+            return "clockwise"
+        return ""
+
     lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
     if not lines:
-        return "", False
-    last = lines[-1]
+        return "", "", False
+    last = _normalize_line(lines[-1])
 
-    # Determine flagged status from the last line, independent of exact format.
-    lowered = last.lower()
-    flagged = "flagged" in lowered
+    parts = [p.strip() for p in re.split(r"\s*-\s*", last) if p.strip()]
 
-    # Prefer the part before " - " as the value area, but fall back to full line.
-    value_part = last
-    if " - " in last:
-        value_part, _ = last.split(" - ", 1)
-        value_part = value_part.strip()
+    if len(parts) >= 3:
+        flag_part = parts[-1]
+        rot_raw = parts[-2]
+        value_part = " - ".join(parts[:-2])
+        flagged = "flagged" in flag_part.lower()
+        rot = _canonical_rotation(rot_raw) or _rotation_hint(rot_raw)
+        return _parse_value(value_part), rot, flagged
 
-    # First, try to detect an explicit HSCODE pattern like "HSCODE 4707.x0".
-    # Accept small variations in spacing/case.
-    hs_match = re.search(
-        r"(HSCODE\s*\d{4}\.\d0)", value_part, flags=re.IGNORECASE
-    )
-    if hs_match:
-        # Normalize spacing and casing: "HSCODE 4707.x0"
-        raw_hs = hs_match.group(1).strip()
-        parts = raw_hs.split()
-        if len(parts) == 2:
-            return f"HSCODE {parts[1]}", flagged
-        return raw_hs.upper(), flagged
+    if len(parts) == 2:
+        value_part, second = parts[0], parts[1]
+        sk = _compact(second)
+        if sk in _ROT_MAP:
+            return _parse_value(value_part), _ROT_MAP[sk], False
+        sl = second.lower()
+        if sl in ("flagged", "none"):
+            return _parse_value(value_part), "", sl == "flagged"
+        flagged = "flagged" in sl
+        rot = _canonical_rotation(second) or _rotation_hint(second)
+        return _parse_value(value_part), rot, flagged
 
-    # If "HSCODE" appears but the strict pattern did not match (e.g. slightly
-    # different formatting), try to reconstruct "HSCODE <number>" from the text.
-    if "hscode" in value_part.lower():
-        # Extract the first numeric-like token after HSCODE.
-        after = value_part.split("HSCODE", 1)[1]
-        num_match = re.search(r"(\d{3,5}(?:\.\d+)?)", after)
-        if num_match:
-            return f"HSCODE {num_match.group(1)}", flagged
-        # Fall back to returning just "HSCODE" if we cannot find a number.
-        return "HSCODE", flagged
-
-    # At this point we assume it's a plain digit reading (no HSCODE).
-    # Strip any stray words and keep only the first numeric token (with optional decimal).
-    digit_match = re.search(r"(\d{1,4}(?:\.\d+)?)", value_part)
-    digit = digit_match.group(1) if digit_match else ""
-
-    return digit, flagged
+    flagged = "flagged" in last.lower()
+    return _parse_value(last), _rotation_hint(last), flagged
 
 
 def _parse_hscode_to_material(hscode_text: str) -> tuple[str | None, str | None]:
     """
     Normalize flexible HSCODE text to a canonical code and material type.
-
-    Rules:
-    - Ignore casing, spaces, and punctuation (accept \"HS CODE\", \"HSCODE\", \"470710\",
-      \"4707. 10\", etc.).
-    - Only accept codes that normalize to 4707.10, 4707.20, or 4707.30.
-      * 4707.10 -> OCC
-      * 4707.20 -> WHITE
-      * 4707.30 -> MIX
-    - Reject everything else (return (None, None)).
+    Only accepts codes normalizing to 4707.10 (OCC), 4707.20 (WHITE), 4707.30 (MIX).
     """
     if not hscode_text:
         return None, None
 
-    # Remove any leading HSCODE / HS CODE text for robustness.
     lowered = hscode_text.lower()
     lowered = re.sub(r"hs\s*code", "", lowered)
     lowered = re.sub(r"hscode", "", lowered)
 
-    # Keep only digits to ignore spaces and punctuation.
     digits = "".join(ch for ch in lowered if ch.isdigit())
-    if len(digits) < 6:
+    if len(digits) < 6 or not digits.startswith("4707"):
         return None, None
 
-    # Require 4707 as the prefix.
-    if not digits.startswith("4707"):
-        return None, None
-
-    # Take last two digits as the code suffix.
     suffix = digits[-2:]
-    code_map = {
-        "10": "OCC",
-        "20": "WHITE",
-        "30": "MIX",
-    }
-    material_type = code_map.get(suffix)
+    material_type = {"10": "OCC", "20": "WHITE", "30": "MIX"}.get(suffix)
     if not material_type:
         return None, None
 
-    normalized_code = f"4707.{suffix}"
-    return normalized_code, material_type
+    return f"4707.{suffix}", material_type
 
 
 def correct_materials_with_hscode(output_path: str) -> None:
@@ -300,10 +343,8 @@ def correct_materials_with_hscode(output_path: str) -> None:
     Use HSCODE readings in the text_reading cache to correct material_class.
 
     For each cached image:
-      - If text_reading.digit encodes a valid HSCODE (4707.10/20/30 in flexible formats),
-        map to OCC/WHITE/MIX.
-      - If current material_class has a different type (OCC/MIX/WHITE), rewrite it to use
-        the HSCODE-derived type but keep the same position (inventory/closeup/scale/...).
+      - If text_reading.digit encodes a valid HSCODE (4707.10/20/30), map to OCC/WHITE/MIX.
+      - If current material_class has a different type, rewrite it keeping the same position.
       - If the code is invalid or non-4707.xx, do nothing.
     """
     json_dir = os.path.join(output_path, "json")
@@ -317,53 +358,39 @@ def correct_materials_with_hscode(output_path: str) -> None:
         if not digit:
             continue
 
-        # Only consider entries that look like they might contain an HSCODE.
         if "hscode" not in digit.lower() and not any(ch.isdigit() for ch in digit):
             continue
 
         normalized_code, desired_type = _parse_hscode_to_material(digit)
         if not normalized_code or not desired_type:
-            # Reject non-4707.xx codes or unsupported suffixes.
             continue
 
         material_class = cached.get("material_class")
         if not isinstance(material_class, str) or not material_class:
             continue
 
-        # Expect material_class like "OCC - inventory"
         m = re.match(r"^(\w+)\s*-\s*(.+)$", material_class)
         if not m:
             continue
 
         current_type, position = m.group(1), m.group(2)
-        if current_type not in {"OCC", "MIX", "WHITE"}:
-            # Do not override non-paper or unknown types.
+        if current_type not in {"OCC", "MIX", "WHITE"} or current_type == desired_type:
             continue
 
-        if current_type == desired_type:
-            # Already consistent with HSCODE.
-            continue
-
-        new_material_class = f"{desired_type} - {position}"
-        common.save_cached_labels(output_path, base, material_class=new_material_class)
+        common.save_cached_labels(output_path, base, material_class=f"{desired_type} - {position}")
 
 
 def _range_key_for_cached(cached: dict) -> str | None:
-    """
-    Determine which legal range key applies to this cached record, based on
-    its scale_class and material_class.
-    """
+    """Return the LEGAL_DIGIT_RANGE key for this cached record, or None."""
     material_class = cached.get("material_class") or ""
     scale_class = cached.get("scale_class") or ""
 
-    # Device-based ranges from material_class
     lower_mat = material_class.lower()
     if "radiometer" in lower_mat:
         return "radiometer"
     if "watermeter" in lower_mat:
         return "Watermeter"
 
-    # Scale-based ranges from scale_class (e.g. "6_IT_0", "9_WA_0")
     if isinstance(scale_class, str):
         if scale_class.startswith("6_"):
             return "6_"
@@ -379,13 +406,7 @@ def move_out_of_range_and_flagged_to_reject(
     legal_range: dict[str, tuple[float, float]] | None = None,
 ) -> None:
     """
-    Move images whose digit reading is out of range OR flagged == True to a
-    reject folder under output_path.
-
-    - legal_range: mapping like
-        {"6_": (min, max), "9_": (min, max), "radiometer": (min, max), "Watermeter": (min, max)}
-      If None, uses the module-level LEGAL_DIGIT_RANGE.
-    - HSCODE readings are ignored for range checks (but still moved if flagged).
+    Copy out-of-range digit readings to output_path/reject. Input folder is never modified.
     """
     legal_range = legal_range or LEGAL_DIGIT_RANGE
 
@@ -400,25 +421,15 @@ def move_out_of_range_and_flagged_to_reject(
         cached = common.get_cached_labels(output_path, base)
         text_reading = cached.get("text_reading") or {}
         digit_str = text_reading.get("digit") or ""
-        flagged = bool(text_reading.get("flagged"))
+        rotation = text_reading.get("rotation") or ""
 
-        # If nothing to evaluate and not flagged, skip.
-        if not digit_str and not flagged:
+        if not digit_str:
             continue
 
-        # Determine if this record should be rejected.
         reject = False
-
-        # Flagged readings always go to reject.
-        # turn this off for now
-        # if flagged:
-        #     reject = True
-
-        # Range check only applies to numeric digit readings, not HSCODE.
         if not digit_str.upper().startswith("HSCODE"):
             range_key = _range_key_for_cached(cached)
             if range_key and range_key in legal_range:
-                # Extract first numeric token from the digit string.
                 num_match = re.search(r"(\d+(?:\.\d+)?)", str(digit_str))
                 if num_match:
                     try:
@@ -427,7 +438,6 @@ def move_out_of_range_and_flagged_to_reject(
                         if not (min_v <= value <= max_v):
                             reject = True
                     except ValueError:
-                        # Unparsable numeric -> treat as reject for safety.
                         reject = True
 
         if not reject:
@@ -439,18 +449,16 @@ def move_out_of_range_and_flagged_to_reject(
 
         try:
             img = Image.open(img_path).convert("RGB")
-            image_bytes = common.compress_image(img)
+            img = common._rotate_by_text_reading(img, rotation)
+            img_bytes = _image_to_jpeg_bytes(img)
             with open(os.path.join(reject_dir, f"{base}.jpg"), "wb") as f:
-                f.write(image_bytes)
-            os.remove(img_path)
+                f.write(img_bytes)
         except Exception as e:
             print(f"Failed to copy {base} to reject folder: {e}")
 
 
 def _iter_json_basenames(output_path: str) -> Iterable[str]:
-    """
-    Yield basenames (without .json) for all json files under output_path/json.
-    """
+    """Yield basenames (without .json) for all json files under output_path/json."""
     json_dir = os.path.join(output_path, "json")
     if not os.path.isdir(json_dir):
         return []
@@ -459,13 +467,10 @@ def _iter_json_basenames(output_path: str) -> Iterable[str]:
             yield os.path.splitext(name)[0]
 
 
-def _resolve_image_path(input_folder: str, image_name_without_suffix: str) -> str | None:
-    """
-    Try to find the corresponding image file in input_folder with common extensions.
-    """
-    exts = [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"]
-    for ext in exts:
-        candidate = os.path.join(input_folder, image_name_without_suffix + ext)
+def _resolve_image_path(input_folder: str, base: str) -> str | None:
+    """Return the first matching image path for base in input_folder, or None."""
+    for ext in _IMAGE_EXTENSIONS:
+        candidate = os.path.join(input_folder, base + ext)
         if os.path.isfile(candidate):
             return candidate
     return None
@@ -473,36 +478,17 @@ def _resolve_image_path(input_folder: str, image_name_without_suffix: str) -> st
 
 def _has_target_label(cached: dict) -> bool:
     """
-    Check if the image has any of the target labels that require text reading
-    AND the label confidence is above the threshold:
-    - "sign" >= 55
-    - "oldWatermeter" or "newWatermeter" >= 50
-    - "radiometer" >= 50
-    - "LCD_SCREEN" variants >= 60
+    Return True if the image has any target label above its confidence threshold:
+    sign >= 55, oldWatermeter/newWatermeter/radiometer >= 50, LCD_SCREEN* >= 60.
     """
-    # Check scale_labels
-    for label in cached.get("scale_labels", []):
+    for label in cached.get("scale_labels", []) + cached.get("material_labels", []):
         label_name = label.get("Name", "")
         confidence = label.get("Confidence", 0)
-        
-        # Check LCD_SCREEN variants
         if label_name.startswith("LCD_SCREEN") and confidence >= 60.0:
             return True
-        
-        # Check other target labels
         threshold = TEXT_READING_THRESHOLDS.get(label_name)
         if threshold is not None and confidence >= threshold:
             return True
-    
-    # Check material_labels
-    for label in cached.get("material_labels", []):
-        label_name = label.get("Name", "")
-        confidence = label.get("Confidence", 0)
-        
-        threshold = TEXT_READING_THRESHOLDS.get(label_name)
-        if threshold is not None and confidence >= threshold:
-            return True
-    
     return False
 
 
@@ -514,43 +500,35 @@ def add_text_reading_to_jsons(
     progress_callback=None,
 ) -> None:
     """
-    For each cached image JSON in output_path/json, read the image, optionally crop
-    to the LCD screen, call Bedrock VLM, and write a `text_reading` field into
-    the JSON:
-
-        \"text_reading\": {\"digit\": <str>, \"flagged\": <bool>}
-
-    This does not modify any Streamlit UI.
+    Loop over image files in input_folder, look up their cached metadata in
+    output_path/json, feed to Bedrock VLM if a target label is present, parse
+    the response, and write text_reading into the JSON cache.
     """
-    basenames = list(_iter_json_basenames(output_path))
-    total = len(basenames)
+    image_files = [
+        f for f in os.listdir(input_folder)
+        if os.path.splitext(f)[1] in _IMAGE_EXTENSIONS
+    ]
+    total = len(image_files)
     current = 0
     local_state = threading.local()
-    max_workers = max(1, int(getattr(text_config, "max_workers", 4)))
+    max_workers = max(1, int(text_config.max_workers))
     pending_jobs: list[tuple[str, str, list]] = []
 
-    for base in basenames:
+    for filename in image_files:
+        base = os.path.splitext(filename)[0]
+        img_path = os.path.join(input_folder, filename)
         cached = common.get_cached_labels(output_path, base)
 
-        # Skip if we already have text_reading
         if cached.get("text_reading") is not None:
             current += 1
             if progress_callback:
                 progress_callback(current, total, f"Skipping {base} (already has text_reading)")
             continue
 
-        # Only process images with target labels: sign, Watermeter, radiometer, LCD_SCREEN
         if not _has_target_label(cached):
             current += 1
             if progress_callback:
                 progress_callback(current, total, f"Skipping {base} (no target labels)")
-            continue
-
-        img_path = _resolve_image_path(input_folder, base)
-        if not img_path:
-            current += 1
-            if progress_callback:
-                progress_callback(current, total, f"Image not found for {base}, skipping")
             continue
 
         scale_labels = cached.get("scale_labels", [])
@@ -563,9 +541,7 @@ def add_text_reading_to_jsons(
                 base,
                 img_path,
                 scale_labels,
-                text_config.prompt,
-                text_config.model_id,
-                text_config.region,
+                text_config,
                 aws_profile,
                 local_state,
             ): base
@@ -577,11 +553,17 @@ def add_text_reading_to_jsons(
             try:
                 result = future.result()
                 if result.get("error"):
-                    # Log to stdout; callers can inspect JSONs later.
                     print(f"text_reading failed for {base}: {result['error']}")
                 else:
-                    text_reading = {"digit": result["digit"], "flagged": bool(result["flagged"])}
-                    common.save_cached_labels(output_path, base, text_reading=text_reading)
+                    common.save_cached_labels(
+                        output_path,
+                        base,
+                        text_reading={
+                            "digit": result["digit"],
+                            "rotation": result["rotation"],
+                            "flagged": bool(result["flagged"]),
+                        },
+                    )
             except Exception as e:
                 print(f"text_reading failed for {base}: {e}")
 
