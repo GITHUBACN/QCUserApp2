@@ -88,9 +88,9 @@ def _smart_fix_orientation(input_path: str) -> Image.Image:
     return Image.fromarray(fixed)
 
 
-def _prefix_match(target: str, prefix_list: list) -> bool:
-    for i in prefix_list:
-        if i in target:
+def _contains_any(target: str, substrings: list) -> bool:
+    for s in substrings:
+        if s in target:
             return True
     return False
 
@@ -104,13 +104,13 @@ def _classify_name(labels: list) -> str:
             screen_found = True
         elif label["Name"] in extras:
             pass
-        elif label["Name"] in class_to_dir or _prefix_match(label["Name"], material_devices):
+        elif label["Name"] in class_to_dir or _contains_any(label["Name"], material_devices):
             if label["Confidence"] > max_confidence:
                 max_confidence = label["Confidence"]
                 max_label = label["Name"]
     if not max_label:
         return "unknown_device" if screen_found else "next_stage"
-    if _prefix_match(max_label, material_devices):
+    if _contains_any(max_label, material_devices):
         max_label = next((d for d in material_devices if d in max_label), max_label)
     return max_label
 
@@ -172,14 +172,14 @@ def classify_scales(
     """
     toNextStage = []
     material_device_list = {}
-    total = len([p for p in file_paths if p[-4:].lower() in (".jpg", ".jpeg", ".png")])
+    total = len([p for p in file_paths if p.lower().endswith(('.jpg', '.jpeg', '.png'))])
     current = 0
 
     pending_jobs: list[tuple[str, str]] = []
     worker_count = max(1, int(max_workers))
 
     for uploaded_file in file_paths:
-        if uploaded_file[-4:].lower() not in (".jpg", ".jpeg", ".png"):
+        if not uploaded_file.lower().endswith(('.jpg', '.jpeg', '.png')):
             continue
 
         filename = os.path.basename(uploaded_file)

@@ -201,16 +201,13 @@ def classify_materials(
     Run material classification. Uses unified cache: if material_labels exist, skip API.
     progress_callback(current, total, message) is optional.
     """
-    total = len([
-        p for p in uploaded_files_list
-        if p[-4:].lower() in (".jpg", ".jpeg", ".png")
-    ])
+    total = len([p for p in uploaded_files_list if p.lower().endswith(('.jpg', '.jpeg', '.png'))])
     current = 0
     worker_count = max(1, int(max_workers))
     pending_jobs: list[tuple[str, str, str | None]] = []
 
     for uploaded_file in uploaded_files_list:
-        if uploaded_file[-4:].lower() not in (".jpg", ".jpeg", ".png"):
+        if not uploaded_file.lower().endswith(('.jpg', '.jpeg', '.png')):
             continue
 
         filename = os.path.basename(uploaded_file)

@@ -5,9 +5,20 @@ and unified per-image label cache. No Streamlit.
 import io
 import json
 import os
+import threading
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageOps
+
+_json_locks: dict[str, threading.Lock] = {}
+_json_locks_mutex = threading.Lock()
+
+
+def _get_json_lock(path: str) -> threading.Lock:
+    with _json_locks_mutex:
+        if path not in _json_locks:
+            _json_locks[path] = threading.Lock()
+        return _json_locks[path]
 
 
 def compress_image(img, max_size: int = 1024, quality: int = 85) -> bytes:
@@ -88,22 +99,24 @@ def save_cached_labels(
 ) -> None:
     """
     Update or create unified cache file. Pass only keys to update; others are preserved.
+    Thread-safe: uses a per-file lock to prevent concurrent read-modify-write races.
     """
     path = _json_path(output_path, image_name_without_suffix)
-    data = get_cached_labels(output_path, image_name_without_suffix)
-    if scale_labels is not None:
-        data["scale_labels"] = scale_labels
-    if scale_class is not None:
-        data["scale_class"] = scale_class
-    if material_labels is not None:
-        data["material_labels"] = material_labels
-    if material_class is not None:
-        data["material_class"] = material_class
-    if text_reading is not None:
-        data["text_reading"] = text_reading
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    with _get_json_lock(path):
+        data = get_cached_labels(output_path, image_name_without_suffix)
+        if scale_labels is not None:
+            data["scale_labels"] = scale_labels
+        if scale_class is not None:
+            data["scale_class"] = scale_class
+        if material_labels is not None:
+            data["material_labels"] = material_labels
+        if material_class is not None:
+            data["material_class"] = material_class
+        if text_reading is not None:
+            data["text_reading"] = text_reading
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
 
 def _resolve_image_path(input_folder: str, base: str) -> str | None:
@@ -168,7 +181,7 @@ def copy_images_to_classified_folders(
                 progress_callback(current, total, f"Copy: image not found for {base}")
             continue
         os.makedirs(full_save_path, exist_ok=True)
-        img = Image.open(img_path).convert("RGB")
+        img = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
         text_reading = cached.get("text_reading") or {}
         rotation = text_reading.get("rotation") or ""
         img = _rotate_by_text_reading(img, rotation)

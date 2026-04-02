@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 
 import boto3
-from PIL import Image
+from PIL import Image, ImageOps
 
 from backend import common
 
@@ -50,9 +50,7 @@ def _get_bedrock_client(region: str, profile_name: str | None = None):
     If AWS_BEARER_TOKEN_BEDROCK is set, use a plain boto3 client (same as crop.ipynb).
     Otherwise fall back to an IAM profile when provided.
     """
-    token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip().strip('"').strip("'")
-    if token:
-        os.environ["AWS_BEARER_TOKEN_BEDROCK"] = token
+    if os.environ.get("AWS_BEARER_TOKEN_BEDROCK"):
         return boto3.client(service_name="bedrock-runtime", region_name=region)
     if profile_name:
         session = boto3.Session(profile_name=profile_name)
@@ -71,7 +69,7 @@ def _cropped_image_from_rekognition(
     Crop the highest-confidence LCD_SCREEN_0 / LCD_SCREEN_0_MAIN bbox.
     Falls back to the full image if no suitable label is found.
     """
-    image = Image.open(image_path).convert("RGB")
+    image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
     img_w, img_h = image.size
 
     target_label_names = ["LCD_SCREEN_0", "LCD_SCREEN_0_MAIN"]
@@ -117,6 +115,50 @@ def _image_to_jpeg_bytes(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
+_ROTATION_VARIANTS: list[tuple[str, int]] = [
+    ("upStraight",       0),
+    ("counterClockwise", 90),
+    ("upsideDown",      180),
+    ("clockwise",       270),
+]
+
+_UPRIGHT_PROMPT = (
+    "I am showing you 4 versions of the same image, each rotated differently:\n"
+    "- Image 1: original orientation\n"
+    "- Image 2: rotated 90° counter-clockwise from original\n"
+    "- Image 3: rotated 180° from original\n"
+    "- Image 4: rotated 90° clockwise from original\n\n"
+    "Look at the digits or text visible in each image. "
+    "Which single image number (1, 2, 3, or 4) shows the content most upright and readable?\n\n"
+    "Reply with ONLY a single digit: 1, 2, 3, or 4."
+)
+
+
+def _find_upright_rotation(
+    img: Image.Image,
+    client,
+    model_id: str,
+) -> tuple[Image.Image, str]:
+    """
+    Send all 4 rotations to Bedrock in one call.
+    Returns (upright_image, rotation_label). Falls back to original if response is unexpected.
+    """
+    rotated_imgs = [img.rotate(deg, expand=True) for _, deg in _ROTATION_VARIANTS]
+    rotated_bytes = [_image_to_jpeg_bytes(r) for r in rotated_imgs]
+
+    content: list[dict] = [{"text": _UPRIGHT_PROMPT}]
+    for b in rotated_bytes:
+        content.append({"image": {"format": "jpeg", "source": {"bytes": b}}})
+
+    conversation = [{"role": "user", "content": content}]
+    raw = _invoke_bedrock(client, model_id, conversation, max_tokens=10, temperature=0.0)
+
+    match = re.search(r"[1-4]", raw or "")
+    idx = (int(match.group()) - 1) if match else 0
+    label, _ = _ROTATION_VARIANTS[idx]
+    return rotated_imgs[idx], label
+
+
 def _construct_conversation(prompt: str, image_bytes: bytes) -> list[dict]:
     """Build a Bedrock Converse payload with one user message containing text + image."""
     return [
@@ -158,23 +200,6 @@ def _invoke_bedrock(
     return ""
 
 
-def _debug_save(img: Image.Image, img_bytes: bytes, base: str) -> None:
-    """
-    Optional debug: save the PIL crop and exact JPEG bytes sent to Bedrock.
-    Controlled by TEXT_READING_DEBUG_CROP_DIR (folder path) and
-    TEXT_READING_DEBUG_SHOW_CROP=1 (open system viewer).
-    """
-    out_dir = os.environ.get("TEXT_READING_DEBUG_CROP_DIR", "").strip()
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-        img.save(os.path.join(out_dir, f"{base}_vlm_crop.jpg"), format="JPEG", quality=85, optimize=True)
-        with open(os.path.join(out_dir, f"{base}_vlm_request.jpg"), "wb") as f:
-            f.write(img_bytes)
-        print(f"[debug] saved crop + request JPEG for {base} → {out_dir}")
-
-    if os.environ.get("TEXT_READING_DEBUG_SHOW_CROP", "").strip().lower() in ("1", "true", "yes", "on"):
-        img.show(title=f"{base} VLM crop")
-
 
 def _process_text_reading_worker(
     base: str,
@@ -192,8 +217,10 @@ def _process_text_reading_worker(
             )
 
         cropped = _cropped_image_from_rekognition(img_path, scale_labels)
-        img_bytes = _image_to_jpeg_bytes(cropped)
-        #_debug_save(cropped, img_bytes, base)
+        upright, rotation = _find_upright_rotation(
+            cropped, local_state.client, text_config.model_id
+        )
+        img_bytes = _image_to_jpeg_bytes(upright)
 
         conversation = _construct_conversation(text_config.prompt, img_bytes)
         raw = _invoke_bedrock(
@@ -203,7 +230,7 @@ def _process_text_reading_worker(
             max_tokens=text_config.max_tokens,
             temperature=text_config.temperature,
         )
-        digit, rotation, flagged = _parse_text_reading_output(raw)
+        digit, _, flagged = _parse_text_reading_output(raw)
         return {"base": base, "digit": digit, "rotation": rotation, "flagged": bool(flagged), "error": None}
     except Exception as e:
         return {"base": base, "digit": "", "rotation": "", "flagged": False, "error": str(e)}
@@ -322,15 +349,11 @@ def _parse_hscode_to_material(hscode_text: str) -> tuple[str | None, str | None]
     if not hscode_text:
         return None, None
 
-    lowered = hscode_text.lower()
-    lowered = re.sub(r"hs\s*code", "", lowered)
-    lowered = re.sub(r"hscode", "", lowered)
-
-    digits = "".join(ch for ch in lowered if ch.isdigit())
-    if len(digits) < 6 or not digits.startswith("4707"):
+    match = re.search(r"4707[.\s]?(\d{2})", hscode_text, flags=re.IGNORECASE)
+    if not match:
         return None, None
 
-    suffix = digits[-2:]
+    suffix = match.group(1)
     material_type = {"10": "OCC", "20": "WHITE", "30": "MIX"}.get(suffix)
     if not material_type:
         return None, None
